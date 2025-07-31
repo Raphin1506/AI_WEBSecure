@@ -18,11 +18,11 @@ import threading
 import sys
 from collections import deque
 from pathlib import Path
-
+from pyshark.packet.packet import Packet
 import pandas as pd
 import streamlit as st
 from sklearn.ensemble import IsolationForest
-
+from io import StringIO
 ###########################################################################
 # Compat / setup                                                          #
 ###########################################################################
@@ -62,7 +62,7 @@ except ModuleNotFoundError:
 PACKET_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=5_000)
 
 
-def _packet_to_row(pkt: "pyshark.packet.packet.Packet") -> dict:
+def _packet_to_row(pkt: Packet) -> dict:
     """Extract minimal fields needed for anomaly detection."""
     try:
         proto = pkt.transport_layer or "N/A"
@@ -140,21 +140,49 @@ def stop_live_capture():
 # Anomaly detection                                                       #
 ###########################################################################
 
-def detectar_anomalias(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
+def detectar_anomalias(df, colunas):
+    modelo = IsolationForest(contamination=0.05, random_state=42)
+    df['score'] = modelo.fit_predict(df[colunas])
+    df['anomalia'] = modelo.decision_function(df[colunas])
+    df['risco'] = df['anomalia'].apply(classificar_risco)
+    df['acao_recomendada'] = df['acao'].apply(sugerir_acao)
+    return df[df['score'] == -1]  # Somente anomalias
 
-    work = df.copy()
-    work[features] = work[features].fillna(0).astype(float)
+# Dicionário de recomendações
+RECOMENDACOES = {
+    "SSH": "Verificar tentativas de brute force e bloquear IP se necessário.",
+    "RDP": "Avaliar necessidade de acesso remoto e aplicar autenticação forte.",
+    "FTP": "Desabilitar FTP se não for necessário; usar SFTP como alternativa segura.",
+    "SMB": "Verificar exposição da porta 445 e aplicar patches de segurança.",
+    "POST": "Monitorar payloads recebidos — pode indicar tentativa de injeção ou exfiltração.",
+    "MySQL": "Verificar acessos não autorizados e revisar credenciais do banco de dados.",
+    "GET": "Monitorar volume de requisições para evitar possíveis ataques de scraping ou DDoS."
+}
 
-    iso = IsolationForest(n_estimators=150, contamination=0.05, random_state=42)
-    iso.fit(work[features])
-    preds = iso.predict(work[features])  # 1 = normal, ‑1 = anomaly
-    df = df.assign(
-        risco=["ALTO" if p == -1 else "BAIXO" for p in preds],
-        acao_recomendada=["Investigar" if p == -1 else "Monitorar" for p in preds],
-    )
-    return df[df["risco"] == "ALTO"]
+def sugerir_acao(acao):
+    return RECOMENDACOES.get(acao, "Investigar atividade incomum e revisar políticas de acesso.")
+
+def classificar_risco(score):
+    if score < -0.25:
+        return "ALTO"
+    elif score < -0.10:
+        return "MÉDIO"
+    else:
+        return "BAIXO"
+
+def gerar_relatorio_texto(df) -> str:
+                        buf = StringIO()
+                        data = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        buf.write(f"🛡️ Relatório de Segurança - {data}\n\n")
+                        for _, row in df.iterrows():
+                            buf.write(f"📅 Data/Hora: {row.get('timestamp', '-')}\n")
+                            buf.write(f"🌐 IP: {row.get('ip', row.get('ip_src', '-'))}\n")
+                            buf.write(f"🔐 Ação: {row.get('acao', row.get('proto', '-'))}\n")
+                            buf.write(f"⚠️ Score de Anomalia: {row['anomalia']:.4f}\n")
+                            buf.write(f"🚨 Risco: {row['risco']}\n")
+                            buf.write(f"💡 Ação Recomendada: {row['acao_recomendada']}\n")
+                            buf.write("-" * 40 + "\n")
+                        return buf.getvalue()
 
 ###########################################################################
 # Streamlit UI                                                            #
@@ -215,7 +243,7 @@ with left:
     df_live = pd.DataFrame(rows)
 
     if not df_live.empty:
-        anomalies_live = detectar_anomalias(df_live, ["src_port", "dst_port", "size"])
+        anomalies_live = detectar_anomalias(df_live, ["porta_origem", "porta_destino", "tamanho_pacote"])
         st.dataframe(df_live.tail(100), use_container_width=True)
         if not anomalies_live.empty:
             st.error(f"🚨 {len(anomalies_live)} ameaças detectadas em tempo real!")
@@ -234,16 +262,25 @@ with right:
             df_csv = pd.DataFrame()
 
         if not df_csv.empty:
-            missing = {"src_port", "dst_port", "size"} - set(df_csv.columns)
+            missing = {"porta_origem", "porta_destino", "tamanho_pacote"} - set(df_csv.columns)
             if missing:
                 st.warning(f"CSV faltando colunas {missing}. Tente mapear ou renomear antes de enviar.")
             else:
-                anomalies_csv = detectar_anomalias(df_csv, ["src_port", "dst_port", "size"])
+                anomalies_csv = detectar_anomalias(df_csv, ["porta_origem", "porta_destino", "tamanho_pacote"])
                 st.write("Amostra dos dados:")
-                st.dataframe(df_csv.head(20), use_container_width=True)
+                st.dataframe(df_csv[df_csv.columns.difference(["score", "anomalia", "risco", "acao_recomendada"])].head(20), use_container_width=True)
+
                 if not anomalies_csv.empty:
                     st.error(f"🚨 {len(anomalies_csv)} ameaças encontradas no arquivo!")
                     st.dataframe(anomalies_csv, use_container_width=True)
+
+                    relatorio = gerar_relatorio_texto(anomalies_csv)
+                    st.download_button(
+                        label="⬇️ Baixar Relatório de Ameaças",
+                        data=relatorio,
+                        file_name="relatorio_cybersentinel.txt",
+                        mime="text/plain"
+                    )
                 else:
                     st.success("Nenhuma anomalia encontrada no arquivo enviado.")
     else:
